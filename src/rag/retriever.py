@@ -44,7 +44,7 @@ def ingest(collection_name: str, text_chunks: list[str], metadata_list: list[dic
 
     print(f"[Retriever] Ingesting {len(text_chunks)} chunks into collection '{collection_name}'")
 
-    embeddings = [embad(chunk) for chunk in text_chunks]
+    embeddings = [embed(chunk) for chunk in text_chunks]
     ids = [str(uuid.uuid4()) for _ in text_chunks]
 
     # documents = raw text chunks
@@ -63,36 +63,35 @@ def ingest(collection_name: str, text_chunks: list[str], metadata_list: list[dic
     print(f"[Retriever] Successfully ingested {len(text_chunks)} chunks into collection '{collection_name}'")
 
 
+def retriever(collection_name: str, query: str, top_k: int = 5) -> list[str]:
+    """
+    Retrieve the top K most relevant chunks from the specified collection based on the query.
+    Call this on every user question to get the relevant context for the LLM.
+    Args:
+        collection_name (str): The name of the collection to search in (should correspond to agent collection).
+        query (str): The user question or query string to find relevant chunks for.
+        top_k (int, optional): The number of top relevant chunks to return. Defaults to 5.
+    Returns:
+        list[str]: A list of the top K most relevant text chunks retrieved from the collection.
+    """
+    collection = _get_collection(collection_name)
+    if collection.count() == 0:
+        print(f"[Retriever] Warning: Collection '{collection_name}' is empty. No chunks to retrieve.")
+        return []
 
-    def retrieve(collection_name: str, query: str, top_k: int = 5) -> list[str]:
-        """
-        Retrieve the top K most relevant chunks from the specified collection based on the query.
-        Call this on every user question to get the relevant context for the LLM.
-        Args:
-            collection_name (str): The name of the collection to search in (should correspond to agent collection).
-            query (str): The user question or query string to find relevant chunks for.
-            top_k (int, optional): The number of top relevant chunks to return. Defaults to 5.
-        Returns:
-            list[str]: A list of the top K most relevant text chunks retrieved from the collection.
-        """
-        collection = _get_collection(collection_name)
-        if collection.count() == 0:
-            print(f"[Retriever] Warning: Collection '{collection_name}' is empty. No chunks to retrieve.")
-            return []
-        
-        query_embedding = embed(query)
+    query_embedding = embed(query)
 
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            include=["documents", "distances"],  # we only need the original text chunks as output, not the embeddings or metadata
-        )
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=["documents", "distances"],
+    )
 
-        retrieved_chunks = results["documents"][0]  # list of top K chunks
-        retrieved_distances = results["distances"][0]  # list of cosine distances for the top K chunks (lower = more similar)
+    retrieved_chunks = results["documents"][0]
+    retrieved_distances = results["distances"][0]
 
-        print(f"[Retriever] Retrieved {len(retrieved_chunks)} chunks from collection '{collection_name}' for query: {query[:80]}...")
-        for i, (chunk, distance) in enumerate(zip(retrieved_chunks, retrieved_distances)):
-            print(f"Fact {i+1}. (distance: {distance:.4f}) {chunk[:80]}...")
+    print(f"[Retriever] Retrieved {len(retrieved_chunks)} chunks from collection '{collection_name}' for query: {query[:80]}...")
+    for i, (chunk, distance) in enumerate(zip(retrieved_chunks, retrieved_distances)):
+        print(f"Fact {i+1}. (distance: {distance:.4f}) {chunk[:80]}...")
 
-        return retrieved_chunks
+    return retrieved_chunks

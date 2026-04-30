@@ -43,13 +43,16 @@ DEMO KNOWLEDGE BASE:
 
 import uuid
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agents.selector import select_agent
-from rag.retriever import ingest, retrieve
+from rag.retriever import ingest, retriever
 from llm.provider import stream_answer
 from conversation.history import add_message, get_history, clear_history
 
