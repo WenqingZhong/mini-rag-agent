@@ -1,101 +1,278 @@
 """
-CONCEPT: LLM Provider (Interface to LLMs) + Prompt Assmembly
+CONCEPT: LLM Provider  (updated: TIER 2 — Token Management + Tool Calling)
+============================================================================
+Production equivalents:
+  - InternalPromptService    (prompt assembly)
+  - TokenManagementService   (token counting + budget trimming)
+  - LlmGatewayOpenAiStreamingProvider  (streaming call)
+  - McpToOpenAiConverter + MCPRegistryLiteService (tool calling loop)
 
-1. Build the final prompt by combining:
-- System prompt (agent's personality and behavior guidelines)
-- Context (retrieved facts from ChromeDB) -> RAG
-- History (last N messages from the conversation) -> Short-term memory
-- User (current question)
+NEW IN THIS VERSION:
 
-2. Call the LLM with streaming enabled and yield tokens one by one.
+  1. TOKEN BUDGET MANAGEMENT
+     Before sending to the LLM, we count tokens in every message and trim
+     history from oldest-first until the total fits within BUDGET_HISTORY.
+     Uses tiktoken (same library as jtokkit conceptually).
+     Production: TokenManagementService.calculateGPTTokens() with
+     JTokkitTokenCountEstimator(EncodingType.CL100K_BASE / O200K_BASE)
 
-KEY INSIGHT - Why facts go in the system prompt:
-- By putting facts in system promot instead of user prompt, we keep the conversation history cleaner 
-and prevent the LLM from forgetting the context when history gets too long.
+  2. TOOL CALLING LOOP
+     - First call: non-streaming + tools → detect if LLM wants to call a tool
+     - If tool calls: execute them, add results to messages
+     - Final call: streaming → yield tokens to client
+     Production: FactCompilationService.getMcpFacts() pre-executes MCP tools;
+     here the LLM itself decides when to call tools (OpenAI function calling).
 
+  3. MEMORIES INJECTED INTO SYSTEM PROMPT
+     Long-term user memories are now a separate section in the system message,
+     distinct from the RAG facts. This mirrors how MemoryService results are
+     injected in StreamingChatService.handlePrompt().
 """
-from openai import OpenAI
-from typing import Generator
 
+import json
+from typing import Generator
+from openai import OpenAI
+import tiktoken
+
+from llm.tools import TOOLS, execute_tool
+from utils.logger import get_logger
+from config import (
+    CHAT_MODEL,
+    BUDGET_SYSTEM_PROMPT,
+    BUDGET_FACTS,
+    BUDGET_MEMORY,
+    BUDGET_HISTORY,
+)
+
+logger = get_logger("provider")
 client = OpenAI()
 
-CHAT_MODEL = "gpt-4o-mini" #swao to  "gpt-4o" for higher quality but more expensive responses
+# tiktoken encoder — cl100k_base covers gpt-4o-mini, gpt-4o, gpt-4
+# Production: JTokkitTokenCountEstimator with EncodingType.CL100K_BASE
+try:
+    _encoder = tiktoken.encoding_for_model(CHAT_MODEL)
+except KeyError:
+    _encoder = tiktoken.get_encoding("cl100k_base")
 
-#----------------------------------
-# Prompt assembly - RAG prompt for context injection.
-#----------------------------------
 
-CONTEXT_SECTION = """\
---- RELEVANT CONTEXT ---
-{context}
---- END OF CONTEXT ---
+# ── Token utilities ───────────────────────────────────────────────────────────
 
-Use the context above to answer the question. If the context does not contain enough information, 
-answer to the best of your ability based on your general knowledge, but clearly state that you are doing so.
 
-"""
+def count_tokens(text: str) -> int:
+    """
+    Count the approximate number of tokens in a string.
+    Production: TokenManagementService calls JTokkitTokenCountEstimator.estimate()
+    Falls back to character/4 heuristic if encoder fails (same as estimateTokens()).
+    """
+    try:
+        return len(_encoder.encode(text))
+    except Exception:
+        return max(1, len(text) // 4)  # fallback: 4 chars ≈ 1 token
+
+
+def _trim_history_to_budget(
+    history: list[dict],
+    budget: int = BUDGET_HISTORY,
+) -> list[dict]:
+    """
+    Remove oldest messages until history fits within the token budget.
+
+    Strategy: drop from the front (oldest first), keep the most recent exchanges.
+    Production: TokenManagementService trims based on exact token counts,
+    this mirrors that logic using tiktoken.
+
+    Args:
+        history: List of {"role": ..., "content": ...} dicts
+        budget:  Max tokens allowed for history
+
+    Returns:
+        Trimmed history list
+    """
+    trimmed = list(history)
+    while trimmed:
+        total = sum(count_tokens(m["content"]) for m in trimmed)
+        if total <= budget:
+            break
+        trimmed.pop(0)  # drop oldest message
+
+    if len(trimmed) < len(history):
+        logger.info(
+            "History trimmed to fit token budget",
+            extra={"original": len(history), "trimmed": len(trimmed), "budget": budget},
+        )
+    return trimmed
+
+
+# ── Prompt templates ──────────────────────────────────────────────────────────
+
+_FACTS_SECTION = """
+--- RETRIEVED KNOWLEDGE ---
+{facts}
+--- END KNOWLEDGE ---"""
+
+_MEMORY_SECTION = """
+--- WHAT I KNOW ABOUT YOU ---
+{memories}
+--- END USER CONTEXT ---"""
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
+
 
 def stream_answer(
-        agent_config: dict, 
-        facts: list[str], 
-        history: list[dict], 
-        question: str
+    agent: dict,
+    facts: list[str],
+    memories: list[str],
+    history: list[dict],
+    question: str,
 ) -> Generator[str, None, None]:
     """
-    Main entry point. Builds the final prompt and streams the LLM response token by token.
+    Build the prompt, handle tool calls, then stream the final LLM response.
+
+    Flow:
+      1. Assemble messages (system + history + user)
+      2. Trim history to token budget
+      3. First LLM call (non-streaming) to detect tool calls
+      4. Execute any tool calls → add results to messages
+      5. Stream the final answer
+
     Args:
-        agent_config (dict): The configuration for the selected agent, including system prompt and collection.
-        facts (list[str]): The retrieved facts from ChromeDB to be injected into the system prompt.
-        history (list[dict]): The conversation history to be included in the user prompt.
-        question (str): The current user question to be answered by the LLM.
+        agent    : Agent config dict from registry
+        facts    : RAG chunks from retriever (Retrieved Knowledge)
+        memories : Long-term user memories from memory.py
+        history  : Prior conversation turns (trimmed to budget)
+        question : Current user question
+
     Yields:
-        str: The next token in the LLM's response (for SSE streaming).
+        String tokens as they arrive from the LLM
     """
-    messages = _build_messages(agent_config, facts, history, question)
+    messages = _build_messages(agent, facts, memories, history, question)
 
-    print(f"[Provider] Sending to LLM:")
-    print(f" model: {CHAT_MODEL}")
-    print(f" messages: {len(messages)} total"
-          f" system + {len(history)} + 1 user question")
-    print(f" facts: {len(facts)} chunks injected")
+    # ── Log token usage per component ─────────────────────────────────────────
+    system_tokens = count_tokens(messages[0]["content"])
+    history_tokens = sum(count_tokens(m["content"]) for m in messages[1:-1])
+    question_tokens = count_tokens(question)
+    logger.info(
+        "Prompt assembled",
+        extra={
+            "agent": agent["name"],
+            "system_tokens": system_tokens,
+            "history_tokens": history_tokens,
+            "question_tokens": question_tokens,
+            "facts_count": len(facts),
+            "memories_count": len(memories),
+        },
+    )
 
+    # ── Step 1: Non-streaming call with tools to detect tool calls ────────────
+    # Production: FactCompilationService pre-executes MCP tools before streaming.
+    # Here: the LLM itself decides whether to call a tool (OpenAI function calling).
+    #
+    # IMPORTANT: OpenAI rejects tool_choice="auto" when tools=[] (empty list).
+    # Only include tools/tool_choice params when there are tools registered.
+    create_kwargs: dict = dict(
+        model=CHAT_MODEL,
+        messages=messages,
+        stream=False,
+        temperature=0.7,
+    )
+
+    # -----
+    # When you pass tools=TOOLS, OpenAI’s API automatically injects a hidden system-level instruction telling the LLM:
+    # “These tools are available to you. If the user’s question needs one, respond with a tool call instead of plain text.”
+    if TOOLS:
+        create_kwargs["tools"] = TOOLS
+        create_kwargs["tool_choice"] = "auto"  # LLM decides whether to call a tool
+
+    first_response = client.chat.completions.create(**create_kwargs)
+
+    first_msg = first_response.choices[0].message
+
+    # ── Step 2: Execute tool calls if the LLM requested any ───────────────────
+    if first_msg.tool_calls:
+        logger.info(
+            "Tool calls requested",
+            extra={"tools": [tc.function.name for tc in first_msg.tool_calls]},
+        )
+        # Add the assistant's tool-call request to message history
+        messages.append(first_msg)
+
+        # Execute each tool and add the result back
+        for tool_call in first_msg.tool_calls:
+            args = json.loads(tool_call.function.arguments)
+            result = execute_tool(tool_call.function.name, args)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                }
+            )
+
+    elif first_msg.content:
+        # LLM answered directly without tool calls — stream it immediately
+        # (Reconstruct as a streaming-like generator for API consistency)
+        yield first_msg.content
+        return
+
+    # ── Step 3: Final streaming call (with tool results now in messages) ──────
     stream = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=messages,
         stream=True,
         temperature=0.7,
-        max_tokens=1024, 
+        max_tokens=2048,
     )
 
-    # Yield each token as it arrives
     for chunk in stream:
-        if chunk.choices[0].delta.content is not None:
-            yield chunk.choices[0].delta.content
+        delta = chunk.choices[0].delta
+        if delta.content:
+            yield delta.content
+
+
+# ── Private helpers ───────────────────────────────────────────────────────────
 
 
 def _build_messages(
-        agent_config: dict, 
-        facts: list[str], 
-        history: list[dict], 
-        question: str) -> list[dict]:
+    agent: dict,
+    facts: list[str],
+    memories: list[str],
+    history: list[dict],
+    question: str,
+) -> list[dict]:
     """
-    Assemble the messages array in the correct order
-    1. System: agent identity + retrived facts
-    2. History: last N messages from the conversation (if any)
-    3. User: the current question
+    Assemble the final messages array for the LLM call.
 
-    The LLM reads top to bottom, so order matters.
+    Order:
+      [0] system  → agent identity + facts + memories
+      [1..N-1]    → trimmed conversation history
+      [N]         → current user question
+
+    Production: InternalPromptService.buildPrompt() does the same assembly,
+    then TokenManagementService.calculateTokens() audits the final sizes.
     """
-    messages = []
-    system_prompt = agent_config["system_prompt"]
+    # ── System message ────────────────────────────────────────────────────────
+    system_parts = [agent["system_prompt"]]
+
     if facts:
-        format_facts = "\n\n".join([f"Fact {i+1}: {fact}" for i, fact in enumerate(facts)])
-        system_prompt += CONTEXT_SECTION.format(context=format_facts)
-    else:
-        system_prompt += CONTEXT_SECTION.format(context="No relevant facts found in the knowledge base.")
-    
-    messages.append({"role": "system", "content": system_prompt})
-    messages.extend(history) # History is already in the correct format of {"role": ..., "content": ...}
+        formatted = "\n\n".join(f"[{i+1}] {f}" for i, f in enumerate(facts))
+        system_parts.append(_FACTS_SECTION.format(facts=formatted))
+
+    if memories:
+        formatted = "\n".join(f"- {m}" for m in memories)
+        system_parts.append(_MEMORY_SECTION.format(memories=formatted))
+
+    system_parts.append(
+        "\nAlways ground your answer in the RETRIEVED KNOWLEDGE above when relevant."
+    )
+
+    messages = [{"role": "system", "content": "\n".join(system_parts)}]
+
+    # ── Trimmed history ───────────────────────────────────────────────────────
+    trimmed_history = _trim_history_to_budget(history)
+    messages.extend(trimmed_history)
+
+    # ── Current question ──────────────────────────────────────────────────────
     messages.append({"role": "user", "content": question})
 
     return messages

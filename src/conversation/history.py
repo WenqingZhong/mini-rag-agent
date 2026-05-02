@@ -1,62 +1,129 @@
 """
-CONCEPT: Conversation History Manager
+CONCEPT: Conversation History (TIER 1 — SQLite Persistence)
+============================================================
+Production equivalent: MessageManagementService + MessageRepository (Cosmos DB)
 
-By Injecting the last N messages into every LLM call, we give the agent a "short term memory" 
-that allows it to maintain context and continuity across multiple interactions.
+Previously: in-memory dict — wiped on every server restart.
+Now:        SQLite database at ./data/conversations.db
 
-HOW IT WORKS:
-  We store messages as a list of {"role": "user"/"agent"/"system", "content": "the message text"} dicts in memory.}
+SCHEMA:
+    messages (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        role            TEXT NOT NULL,   -- "user" or "assistant"
+        content         TEXT NOT NULL,
+        created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    Index on conversation_id for O(log n) lookups.
 
-TRIMING:
-    Production: calculates exact token counts and trims history to fit wirhin the model's context window
-    Here we simply cap at MAX_HISTORY messages (pairs of user and agent messages) for simplicity.
+WHY SQLite OVER IN-MEMORY?
+  - Survives restarts  → chat history is preserved
+  - Easy to inspect    → open with TablePlus, DBeaver, etc.
+  - Zero infrastructure → no Redis, no Cosmos, no setup needed
+  - Same SQL API       → easy to swap for PostgreSQL later
 
-STORAGE:
-    In-memory dict (lost on restart). For persistence:
-    - SQLite: store messages in a local database file.
-    - Redis: use an in-memory data store for fast access and persistence.
-    Production uses Cosmos DB
+PRODUCTION DIFFERENCE:
+  Cosmos DB scales horizontally; SQLite is a single-file embedded DB.
+  The public API (add_message / get_history / clear_history) is identical —
+  only the storage backend differs.
 """
-# Max number of message pairs to keep in history
-# eg. MAX_HISTORY=10 means we keep the last 10 user messages and 10 agent messages (20 total) in the history context.
-MAX_HISTORY = 10  
 
-# In-memory storage for conversation history
-_store: dict[str, list[dict]] = {}
+import sqlite3
+import os
+from utils.logger import get_logger
+from config import SQLITE_PATH, DATA_DIR
 
-def add_message(conversation_id: str, role: str, content: str):
-    """
-    Add a message to the conversation history.
-    """
-    if conversation_id not in _store:
-        _store[conversation_id] = []
-    
-    _store[conversation_id].append({"role": role, "content": content})
-    
-    # Trim the oldest history to keep only the last MAX_HISTORY messages
-    if len(_store[conversation_id]) > MAX_HISTORY: 
-        trimmed = len(_store[conversation_id]) - MAX_HISTORY 
-        _store[conversation_id] =_store[conversation_id][-MAX_HISTORY:]
-        print(f"[History] Trimmed {trimmed} messages from conversation {conversation_id} history.")
+logger = get_logger("history")
 
-def get_history(conversation_id: str) -> list[dict]:
-    """
-    Retrieve the conversation history for a given conversation ID.
-    This list is passed directly to provider.py as the LLM prior context
-    """
-    return list(_store.get(conversation_id, []))
 
-def clear_history(conversation_id: str):
+def _get_conn() -> sqlite3.Connection:
+    """Open a SQLite connection and ensure the schema exists."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(SQLITE_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            role            TEXT NOT NULL,
+            content         TEXT NOT NULL,
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_id ON messages(conversation_id)")
+    conn.commit()
+    return conn
+
+
+def add_message(conversation_id: str, role: str, content: str) -> None:
     """
-    Clear the conversation history for a given conversation ID.
-    Useful for resetting context after a long conversation or when starting a new topic.
+    Persist one message to SQLite.
+    Production equivalent: MessageManagementService.createMessage()
     """
-    removed = _store.pop(conversation_id, None)
-    if removed:
-        print(f"[History] Cleared {len(removed)} messages for conversation {conversation_id}.")
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)",
+        (conversation_id, role, content),
+    )
+    conn.commit()
+    conn.close()
+    logger.debug(
+        "Message saved",
+        extra={
+            "conversation_id": conversation_id,
+            "role": role,
+            "preview": content[:60],
+        },
+    )
+
+
+def get_history(conversation_id: str, limit: int = 10) -> list[dict]:
+    """
+    Return the last `limit` messages for a conversation, oldest first.
+    The returned dicts match OpenAI's message format and can be passed
+    directly to provider.py without transformation.
+    Production equivalent: MessageManagementService.getSimpleHistory()
+    """
+    conn = _get_conn()
+    rows = conn.execute(
+        """
+        SELECT role, content FROM messages
+        WHERE conversation_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (conversation_id, limit),
+    ).fetchall()
+    conn.close()
+    # Rows come back newest-first (DESC); reverse to chronological order
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+
+def clear_history(conversation_id: str) -> int:
+    """
+    Delete all messages for a conversation.
+    Returns the number of rows deleted.
+    Production equivalent: ConversationManagementService.deleteConversation()
+    """
+    conn = _get_conn()
+    cursor = conn.execute(
+        "DELETE FROM messages WHERE conversation_id = ?",
+        (conversation_id,),
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    logger.info(
+        "History cleared",
+        extra={"conversation_id": conversation_id, "deleted": deleted},
+    )
+    return deleted
+
 
 def conversation_count() -> int:
-    """
-    Utility function to get the number of active conversations in memory (Debugging utility).
-    """
-    return len(_store)
+    """Return the number of distinct conversation IDs. (Debug/admin utility)"""
+    conn = _get_conn()
+    count = conn.execute(
+        "SELECT COUNT(DISTINCT conversation_id) FROM messages"
+    ).fetchone()[0]
+    conn.close()
+    return count
