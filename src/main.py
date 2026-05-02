@@ -209,7 +209,7 @@ def chat(req: ChatRequest):
     agent = select_agent(req.question)
 
     # ── Step 2: Retrieve relevant facts (RAG) ───────────────────────────
-    facts = retrieve(agent["collection"], req.question)
+    facts = retriever(agent["collection"], req.question)
 
     # ── Step 3: Load conversation history ───────────────────────────────
     history = get_history(conversation_id)
@@ -253,7 +253,7 @@ def chat_stream(req: ChatRequest):
         yield f"data: [AGENT:{agent['name']}]\n\n"
 
         # ── Step 2: Retrieve facts ───────────────────────────────────────
-        facts = retrieve(agent["collection"], req.question)
+        facts = retriever(agent["collection"], req.question)
         yield f"data: [FACTS:{len(facts)} retrieved]\n\n"
 
         # ── Step 3: Load history ─────────────────────────────────────────

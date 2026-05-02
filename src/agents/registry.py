@@ -63,7 +63,7 @@ def get_agent(agent_name: str) -> dict:
     Returns:
         dict: The configuration for the specified agent, or an error message if the agent is not found.
     """
-    if name not in AGENT_REGISTRY:
+    if agent_name not in AGENT_REGISTRY:
         raise KeyError(f"Agent '{agent_name}' not found. Available agents: {list(AGENT_REGISTRY.keys())}")
     return AGENT_REGISTRY[agent_name]
 
